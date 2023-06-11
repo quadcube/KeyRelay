@@ -151,8 +151,9 @@ ser = None
 gui = None
 mouse_button = 0x00
 hid_buffer = [0, 0, 0, 0, 0, 0, 0, 0, 0]
-current_display_input = 16 # mDP=16, HDMI1=17
+current_display_input = None # mDP=16, HDMI1=17
 time_since_last_send = time.time()
+time_since_last_send_keycode = time_since_last_send
 
 def pack_signed_char(value):
     if value > 127:
@@ -163,7 +164,7 @@ def pack_signed_char(value):
     return packed_value
 
 def mouse_handle_event(proxy, event_type, event, refcon):
-    global ser, mouse_button, lock_inputs
+    global ser, mouse_button, lock_inputs, time_since_last_send, time_since_last_send_keycode
     if application_active and lock_inputs:
         try: # 1, 2, 3, 4, 5, 6, 7, 22, 25, 26, 27 <- event_type
             rel_x =  CGEventGetIntegerValueField(event, kCGMouseEventDeltaX)
@@ -209,12 +210,14 @@ def mouse_handle_event(proxy, event_type, event, refcon):
                 ser.write(pack_signed_char(value))
         else:
             print("other...{0}".format(event_type))
+        time_since_last_send = time.time()
+        time_since_last_send_keycode = time_since_last_send
         return None
     else:
         return event
 
 def keyboard_handle_event(proxy, event_type, event, refcon):
-    global ser, hid_buffer, mod_byte, application_active, current_display_input, lock_inputs, gui
+    global ser, hid_buffer, mod_byte, application_active, current_display_input, lock_inputs, gui, time_since_last_send, time_since_last_send_keycode
     if application_active and lock_inputs:
         send_HID = True
         if event_type == kCGEventKeyUp: # 11, keyboard related events
@@ -238,6 +241,9 @@ def keyboard_handle_event(proxy, event_type, event, refcon):
                             break
             elif keycode == 105: # F13, for toggling display input
                 send_HID = False
+                current_display_input = subprocess.run("ddcctl -d 2 -i ?", shell=True, capture_output=True)
+                current_display_input = str(current_display_input.stdout)
+                current_display_input = int(current_display_input.split("VCP control #96 (0x60) = current: ")[1].split(",")[0])
                 if current_display_input == 16: # mDP
                     current_display_input = 17
                 else:
@@ -245,11 +251,13 @@ def keyboard_handle_event(proxy, event_type, event, refcon):
                 subprocess.run("ddcctl -d 2 -i " + str(current_display_input), shell=True, capture_output=False)
             elif keycode == 106:
                 if lock_inputs:
+                    send_HID = False
                     lock_inputs = False
                     gui.configure(bg="green")
                     gui.update()
                     CGAssociateMouseAndMouseCursorPosition(True)
-                else:
+                else: # technically, this part will never run unless it's specifically allowed to be monitor when the app is inactive
+                    send_HID = False
                     lock_inputs = True
                     gui.configure(bg="systemWindowBackgroundColor")
                     gui.update()
@@ -284,21 +292,27 @@ def keyboard_handle_event(proxy, event_type, event, refcon):
         
         if event_type == kCGEventKeyDown:
             if (hid_buffer[1] == 0b1000 and remap_left_cmd_to_ctrl == False) or (hid_buffer[1] == 0b1 and remap_left_cmd_to_ctrl == True):
-                if keycode in [0x30]: # Cmd + Tab, allow passthrough
+                if keycode == 0x30: # Cmd + Tab, allow passthrough
                     lock_inputs = False # unlock input and lock internal event handler
+                    hid_buffer = [0, 0, 0, 0, 0, 0, 0, 0, 0] # set internal HID modifier back to 0 (and clear everything) since release of Cmd key will be when the app is inactive
+                    ser.write(bytearray(hid_buffer))
                     return event
             if send_HID: # send output for key down event
                 ser.write(bytearray(hid_buffer))
+            time_since_last_send = time.time()
+            time_since_last_send_keycode = time_since_last_send
             return None
 
         if send_HID: # send output (anything except key down events) 
             ser.write(bytearray(hid_buffer))
+        time_since_last_send = time.time()
+        time_since_last_send_keycode = time_since_last_send
         return event
     else:
         return event
 
 def main():
-    global application_active, ser, prev_x, prev_y, lock_inputs, gui
+    global application_active, ser, prev_x, prev_y, lock_inputs, gui, time_since_last_send, time_since_last_send_keycode
     gui = tk.Tk()
     gui.title("KeyRelay")
     gui.attributes("-transparent", True)
@@ -310,7 +324,7 @@ def main():
     port = '/dev/tty.usbserial-01D29067'
     baud_rate = 230400 # 115200
     ser = serial.Serial(port, baud_rate)
-
+    
     # Create an event tap to monitor mouse events
     mouse_event_tap = CGEventTapCreate(
         kCGSessionEventTap,
@@ -351,7 +365,18 @@ def main():
             # Start the run loop to receive events
             # CFRunLoopRun() # blocking
             while True:
-                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1, True)
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.8, True)
+                if time.time() - time_since_last_send > 0.7:
+                    ser.write(bytearray([255, 0, 0, 0, 0, 0, 0, 0, 0]))
+                    time_since_last_send = time.time()
+                    # print("sent keepalive.")
+                if time.time() - time_since_last_send_keycode > (200 + random.uniform(30, 170)):
+                    # print("Desktop keepalive: {0}s".format(time.time() - time_since_last_send_keycode))
+                    ser.write(bytearray([0, 1, 0, 0, 0, 0, 0, 0, 0])) # send Ctrl modifier
+                    time.sleep(0.005)
+                    ser.write(bytearray([0, 0, 0, 0, 0, 0, 0, 0, 0]))
+                    time_since_last_send = time.time()
+                    time_since_last_send_keycode = time_since_last_send
                 if gui.focus_get() == gui:
                     if application_active == False:
                         time.sleep(0.7)
@@ -362,14 +387,12 @@ def main():
                     application_active = False
                     lock_inputs = True
                     gui.configure(bg="red")
-                    ser.write(bytearray([255, 255, 255, 255, 255, 255, 255, 255, 255]))
                 gui.update()
 
     except Exception as e:
         print(e)
     finally:
         print("Releasing resources...")
-        ser.write(bytearray([255, 255, 255, 255, 255, 255, 255, 255, 255]))
         ser.close()
         CFRunLoopRemoveSource(run_loop, mouse_run_loop_source, kCFRunLoopDefaultMode)
         CFRunLoopRemoveSource(run_loop, keyboard_run_loop_source, kCFRunLoopDefaultMode)
@@ -379,15 +402,6 @@ def main():
         CFRelease(keyboard_event_tap)
         gui.destroy()
         sys.exit()
-
-    #         else:
-    #             if time.time() - time_since_last_send > (250 + random.uniform(30, 120)):
-    #                 ser.write(bytearray([0, 1, 0, 0, 0, 0, 0, 0, 0]))
-    #                 time.sleep(0.1)
-    #                 ser.write(bytearray([0, 0, 0, 0, 0, 0, 0, 0, 0]))
-    #                 time_since_last_send = time.time()
-    #             clock.tick(20)
-
 
 
 if __name__ == '__main__':
